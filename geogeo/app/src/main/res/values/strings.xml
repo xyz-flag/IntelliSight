@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">geogeo</string>
+
+    <string name="geocoding">AIzaSyDeG8SLUlpEIBwcq7HodVBOb6G6vE7TVLg</string>
+    <string name="google_places">AIzaSyBvVpNqioImNC5lIq6bdRnGpvBHsQCHXw4</string>
+    //
+</resources>
