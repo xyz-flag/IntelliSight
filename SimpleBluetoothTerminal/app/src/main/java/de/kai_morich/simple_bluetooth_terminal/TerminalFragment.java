@@ -8,6 +8,9 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.os.Bundle;
 import android.os.IBinder;
 import androidx.annotation.NonNull;
@@ -17,16 +20,68 @@ import android.text.Spannable;
 import android.text.SpannableStringBuilder;
 import android.text.method.ScrollingMovementMethod;
 import android.text.style.ForegroundColorSpan;
+import android.util.Size;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.IOException;
+
+import de.kai_morich.simple_bluetooth_terminal.detector.Classifier;
+import de.kai_morich.simple_bluetooth_terminal.utils.Logger;
+import de.kai_morich.simple_bluetooth_terminal.detector.TFLiteObjectDetectionAPIModel;
+
+
+import static android.graphics.Bitmap.Config.ARGB_8888;
+
 public class TerminalFragment extends Fragment implements ServiceConnection, SerialListener {
+
+    // bluetooth parts
+    public byte[] prev;
+    public int total_sent = 0;
+    public boolean toggle = false;
+    public long start = 0;
+    public long end = 0;
+    public long dur = 0;
+
+    // tflite part
+    private static final Logger LOGGER = new Logger();
+
+    // Configuration values for the prepackaged SSD model.
+    private static final int TF_OD_API_INPUT_SIZE = 300;
+    private static final boolean TF_OD_API_IS_QUANTIZED = true;
+    private static final String TF_OD_API_MODEL_FILE = "detect.tflite";
+    private static final String TF_OD_API_LABELS_FILE = "file:///android_asset/labelmap.txt";
+    private static final DetectorMode MODE = DetectorMode.TF_OD_API;
+    // Minimum detection confidence to track a detection.
+    private static final float MINIMUM_CONFIDENCE_TF_OD_API = 0.5f;
+    private static final boolean MAINTAIN_ASPECT = false;
+    private static final Size DESIRED_PREVIEW_SIZE = new Size(640, 480);
+    private static final boolean SAVE_PREVIEW_BITMAP = false;
+    private static final float TEXT_SIZE_DIP = 10;
+
+    private Integer sensorOrientation;
+
+    private Classifier detector;
+
+    private long lastProcessingTimeMs;
+    private Bitmap rgbFrameBitmap = null;
+    private Bitmap croppedBitmap = null;
+    private Bitmap cropCopyBitmap = null;
+
+    private boolean computingDetection = false;
+
+    private long timestamp = 0;
+
+    private Matrix frameToCropTransform;
+    private Matrix cropToFrameTransform;
+    // end
 
     private enum Connected { False, Pending, True }
 
@@ -34,6 +89,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     private String newline = "\r\n";
 
     private TextView receiveText;
+    private ImageView receiveImage;
 
     private SerialSocket socket;
     private SerialService service;
@@ -121,6 +177,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         receiveText.setTextColor(getResources().getColor(R.color.colorRecieveText)); // set as default color to reduce number of spans
         receiveText.setMovementMethod(ScrollingMovementMethod.getInstance());
         TextView sendText = view.findViewById(R.id.send_text);
+        receiveImage = view.findViewById(R.id.receive_image);
         View sendBtn = view.findViewById(R.id.send_btn);
         sendBtn.setOnClickListener(v -> send(sendText.getText().toString()));
         return view;
@@ -136,6 +193,31 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         int id = item.getItemId();
         if (id == R.id.clear) {
             receiveText.setText("");
+
+
+            // detector start
+            int cropSize = TF_OD_API_INPUT_SIZE;
+
+            try {
+                detector =
+                        TFLiteObjectDetectionAPIModel.create(
+                                getActivity().getAssets(),
+                                TF_OD_API_MODEL_FILE,
+                                TF_OD_API_LABELS_FILE,
+                                TF_OD_API_INPUT_SIZE,
+                                TF_OD_API_IS_QUANTIZED);
+                cropSize = TF_OD_API_INPUT_SIZE;
+            } catch (final IOException e) {
+                e.printStackTrace();
+                LOGGER.e(e, "Exception initializing classifier!");
+                Toast toast =
+                        Toast.makeText(
+                                getActivity().getApplicationContext(), "Classifier could not be initialized", Toast.LENGTH_SHORT);
+                toast.show();
+                getActivity().finish();
+            }
+
+            //
             return true;
         } else if (id ==R.id.newline) {
             String[] newlineNames = getResources().getStringArray(R.array.newline_names);
@@ -180,6 +262,7 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     }
 
     private void send(String str) {
+        start = System.currentTimeMillis();
         if(connected != Connected.True) {
             Toast.makeText(getActivity(), "not connected", Toast.LENGTH_SHORT).show();
             return;
@@ -196,7 +279,44 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
     }
 
     private void receive(byte[] data) {
-        receiveText.append(new String(data));
+        if(prev == null) {
+            prev = data;
+        }
+        else {
+            byte[] temp = new byte[prev.length + data.length];
+            System.arraycopy(prev,0,temp,0,prev.length);
+            System.arraycopy(data,0,temp,prev.length,data.length);
+            prev = temp;
+        }
+        int len = data.length;
+        total_sent = total_sent + len;
+        if(total_sent == 153666){
+            receiveText.append("bytes received:buffer length\n");
+            receiveText.append(String.valueOf((total_sent)));
+            receiveText.append(" vs ");
+            receiveText.append(String.valueOf((prev.length)));
+            receiveText.append("\n");
+            // IMPLEMENT IMAGEVIEW SHOW
+            Bitmap bmp = BitmapFactory.decodeByteArray(prev,0,prev.length);
+            if(bmp == null){
+                receiveText.append("The image is not valid.\n");
+            }
+            else {
+                receiveText.append("The image received is valid.\n");
+                //receiveImage.setImageBitmap(bmp);
+                Bitmap argbBitmap = bmp.copy(ARGB_8888, false);
+                receiveImage.setImageBitmap(Bitmap.createScaledBitmap(bmp, 1440, 1080, false));
+            }
+            end = System.currentTimeMillis();
+            dur = end - start;
+            dur = dur/1000;
+            receiveText.append(String.valueOf(dur));
+            receiveText.append("s have passed.\n");
+            total_sent=0;
+            if(total_sent == 0){
+                prev = new byte[0];
+            }
+        }
     }
 
     private void status(String str) {
@@ -205,6 +325,11 @@ public class TerminalFragment extends Fragment implements ServiceConnection, Ser
         receiveText.append(spn);
     }
 
+    // Which detection model to use: by default uses Tensorflow Object Detection API frozen
+    // checkpoints.
+    private enum DetectorMode {
+        TF_OD_API;
+    }
     /*
      * SerialListener
      */
